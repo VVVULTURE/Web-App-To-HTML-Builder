@@ -60,14 +60,30 @@ ws.onmessage = (m) => {
   if (j.id && pending.has(j.id)) { pending.get(j.id)(j); pending.delete(j.id); return; }
   if (j.method && j.sessionId && sessions.has(j.sessionId)) sessions.get(j.sessionId).push(j);
 };
+// Every CDP call is bounded. A renderer that dies under a 500 MB page never
+// answers, and an unbounded await there hangs the whole pool: node exits with
+// "Detected unsettled top-level await" and the report is never written.
+const CDP_TIMEOUT = Number(arg('--cdp-timeout', 120000));
 const send = (method, params = {}, sessionId) => new Promise((res) => {
-  const n = ++id; pending.set(n, res);
-  ws.send(JSON.stringify({ id: n, method, params, ...(sessionId ? { sessionId } : {}) }));
+  const n = ++id;
+  const timer = setTimeout(() => {
+    if (pending.has(n)) { pending.delete(n); res({ timedOut: true, result: {} }); }
+  }, CDP_TIMEOUT);
+  pending.set(n, (msg) => { clearTimeout(timer); res(msg); });
+  try {
+    ws.send(JSON.stringify({ id: n, method, params, ...(sessionId ? { sessionId } : {}) }));
+  } catch (e) {
+    clearTimeout(timer); pending.delete(n); res({ error: String(e), result: {} });
+  }
 });
 
 async function check(url, waitMs, ignore) {
-  const { result: { targetId } } = await send('Target.createTarget', { url: 'about:blank' });
-  const { result: { sessionId } } = await send('Target.attachToTarget', { targetId, flatten: true });
+  const created = await send('Target.createTarget', { url: 'about:blank' });
+  const targetId = created.result && created.result.targetId;
+  if (!targetId) throw new Error('could not create target (browser may have died)');
+  const attached = await send('Target.attachToTarget', { targetId, flatten: true });
+  const sessionId = attached.result && attached.result.sessionId;
+  if (!sessionId) { await send('Target.closeTarget', { targetId }); throw new Error('could not attach'); }
   const ev = []; sessions.set(sessionId, ev);
   await send('Runtime.enable', {}, sessionId);
   await send('Log.enable', {}, sessionId);
@@ -192,23 +208,39 @@ if (jobsFile) {
   // Simple pool. Each check gets its own target and session, so they are
   // already independent; the only shared resource is browser memory, which
   // is why this is a handful of workers and not one per job.
+  const out = arg('--out', 'verify-report.json');
+  // Flush after every job. A run that dies at 67 of 95 should still leave a
+  // usable report behind -- losing the whole thing to one crashed renderer
+  // costs another full pass.
+  const flush = () => {
+    try {
+      const sorted = results.slice().sort((a, b) => a.name.localeCompare(b.name));
+      writeFileSync(out, JSON.stringify(sorted, null, 2));
+      writeFileSync(cachePath, JSON.stringify(baseCache));
+    } catch { /* keep going; the console log is still the record */ }
+  };
+
+  const JOB_TIMEOUT = Number(arg('--job-timeout', 180000));
+  const withTimeout = (p, ms, label) => Promise.race([
+    p,
+    new Promise((_r, rej) => setTimeout(() => rej(new Error('timed out: ' + label)), ms)),
+  ]);
+
   const queue = jobs.slice();
   await Promise.all(Array.from({ length: Math.min(CONC, queue.length) }, async () => {
     while (queue.length) {
       const j = queue.shift();
-      try { await runJob(j); }
+      try { await withTimeout(runJob(j), JOB_TIMEOUT, j.name); }
       catch (e) {
         n++;
         results.push({ name: j.name, pass: false, harnessError: String(e).slice(0, 200) });
         console.log(`[${String(n).padStart(3)}/${jobs.length}] FAIL  ${j.name}  (harness: ${String(e).slice(0, 80)})`);
       }
+      flush();
     }
   }));
 
-  const out = arg('--out', 'verify-report.json');
-  results.sort((a, b) => a.name.localeCompare(b.name));
-  writeFileSync(out, JSON.stringify(results, null, 2));
-  try { writeFileSync(cachePath, JSON.stringify(baseCache)); } catch { }
+  flush();
   const passed = results.filter((r) => r.pass).length;
   console.log(`\n${passed}/${results.length} passed  ->  ${out}`);
 } else {
