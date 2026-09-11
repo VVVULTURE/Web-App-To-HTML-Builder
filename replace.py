@@ -101,9 +101,21 @@ def do_replace(a):
                       'built': os.path.basename(src)})
         print('[%3d/%d] %s' % (i, len(plan), game))
 
+    # Merge with any previous run. A later pass (more games verified, a fix
+    # landed) must not erase the rollback record of the earlier one -- that
+    # would strand those originals in the backup with nothing pointing at them.
+    mpath = os.path.join(a.backup, MANIFEST)
+    previous = []
+    if os.path.exists(mpath):
+        try:
+            previous = json.load(open(mpath, encoding='utf-8')).get('moved', [])
+        except Exception:
+            previous = []
+    known = {m['game'] for m in previous}
     man = {'when': time.strftime('%Y-%m-%d %H:%M:%S'), 'root': a.root,
-           'backup': a.backup, 'moved': moved}
-    with open(os.path.join(a.backup, MANIFEST), 'w', encoding='utf-8') as fh:
+           'backup': a.backup,
+           'moved': previous + [m for m in moved if m['game'] not in known]}
+    with open(mpath, 'w', encoding='utf-8') as fh:
         json.dump(man, fh, indent=2)
     print('\nreplaced %d games. manifest -> %s'
           % (len(moved), os.path.join(a.backup, MANIFEST)))

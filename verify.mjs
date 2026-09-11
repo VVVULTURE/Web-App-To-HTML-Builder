@@ -182,6 +182,18 @@ if (jobsFile) {
   try { baseCache = JSON.parse(readFileSync(cachePath, 'utf8')); } catch { }
 
   let n = 0;
+  // A job that blew its deadline is recorded as a failure, but the work it
+  // started can still finish and push a SECOND result for the same game --
+  // which silently replaces a real failure with a later pass, or the
+  // reverse. First verdict per game wins.
+  const recorded = new Set();
+  const record = (entry) => {
+    if (recorded.has(entry.name)) return false;
+    recorded.add(entry.name);
+    results.push(entry);
+    return true;
+  };
+
   const runJob = async (j) => {
     const port = await check(j.portUrl, j.wait || 9000, j.ignore);
     let base = null;
@@ -209,11 +221,11 @@ if (jobsFile) {
     const pass = !newErrors.length && !newExc.length
       && !port.netFail.length && !port.subRequests.length && !stuck;
 
-    results.push({ name: j.name, pass, stuck, newErrors, newExceptions: newExc,
+    if (!record({ name: j.name, pass, stuck, newErrors, newExceptions: newExc,
       netFail: port.netFail, subRequests: port.subRequests,
       port: { title: port.title, body: port.body, canvas: port.canvas, text: port.text },
       base: base && { title: base.title, body: base.body, canvas: base.canvas,
-        text: base.text, requests: base.totalRequests } });
+        text: base.text, requests: base.totalRequests } })) return;
     n++;
     console.log(`[${String(n).padStart(3)}/${jobs.length}] ${pass ? 'PASS' : 'FAIL'}  ${j.name}`
       + (pass ? '' : `  (${newErrors.length + newExc.length} new err, `
@@ -248,9 +260,10 @@ if (jobsFile) {
       const j = queue.shift();
       try { await withTimeout(runJob(j), JOB_TIMEOUT, j.name); }
       catch (e) {
-        n++;
-        results.push({ name: j.name, pass: false, harnessError: String(e).slice(0, 200) });
-        console.log(`[${String(n).padStart(3)}/${jobs.length}] FAIL  ${j.name}  (harness: ${String(e).slice(0, 80)})`);
+        if (record({ name: j.name, pass: false, harnessError: String(e).slice(0, 200) })) {
+          n++;
+          console.log(`[${String(n).padStart(3)}/${jobs.length}] FAIL  ${j.name}  (harness: ${String(e).slice(0, 80)})`);
+        }
       }
       flush();
     }
