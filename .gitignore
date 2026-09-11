@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+built/
+out/
+*.html
+!README*
+verify-report.json
+build-report.json
+jobs.json
