@@ -7,3 +7,5 @@ out/
 verify-report.json
 build-report.json
 jobs.json
+.remote-cache/
+.remote-cache/

@@ -87,6 +87,56 @@ def blank_for(ref):
     return BLANK_PNG
 
 
+# Hosts that exist only to talk to the network: ads, analytics, telemetry,
+# consent widgets. These are DROPPED, never fetched -- embedding them would
+# put the very requests back that the port exists to remove. The runtime
+# defines permissive stand-ins for the globals they would have created.
+TELEMETRY = (
+    'googletagmanager.com', 'google-analytics.com', 'googlesyndication.com',
+    'doubleclick.net', 'imasdk.googleapis.com', 'adservice.google',
+    'analytics.google.com', 'poki.com', 'poki-gdn', 'gamemonetize',
+    'gameanalytics', 'connect.facebook.net', 'hotjar', 'mixpanel',
+    'segment.com', 'segment.io', 'sentry.io', 'adinplay', 'playwire',
+    'crazygames.com', 'gamedistribution', 'clarity.ms', 'cookieconsent',
+    'cookielaw', 'onetrust',
+)
+REMOTE_CACHE = os.path.join(HERE, '.remote-cache')
+REMOTE_MAX = 8 * 1024 * 1024        # a library this big is not a library
+
+
+def is_telemetry(url):
+    u = str(url).lower()
+    return any(h in u for h in TELEMETRY)
+
+
+def fetch_remote(url, timeout=20):
+    """Download a remote dependency ONCE, at build time.
+
+    Fetching here is not a contradiction of "no network": the requirement is
+    that the finished file needs no network, and a build step is exactly
+    where a bundler resolves its dependencies. Telemetry is never fetched.
+    """
+    import hashlib, urllib.request, urllib.error
+    if url.startswith('//'):
+        url = 'https:' + url
+    os.makedirs(REMOTE_CACHE, exist_ok=True)
+    cache = os.path.join(REMOTE_CACHE, hashlib.sha256(url.encode()).hexdigest()[:32])
+    if os.path.exists(cache):
+        with open(cache, 'rb') as fh:
+            return fh.read()
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 WATHB'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read(REMOTE_MAX + 1)
+    except Exception:
+        return None
+    if not data or len(data) > REMOTE_MAX:
+        return None
+    with open(cache, 'wb') as fh:
+        fh.write(data)
+    return data
+
+
 def mime_of(p):
     return MIME.get(os.path.splitext(p)[1].lower(), 'application/octet-stream')
 
@@ -106,7 +156,8 @@ def find_entry(vfs):
 
 
 class Builder(object):
-    def __init__(self, root, entry=None, log=False, quiet=True, verbose=True):
+    def __init__(self, root, entry=None, log=False, quiet=True, verbose=True,
+                 fetch_remote=True):
         self.root = os.path.abspath(root)
         self.log = log
         self.quiet = quiet
@@ -116,6 +167,8 @@ class Builder(object):
         self.missing = []          # refs the app names that do not exist
         self.notes = []
         self.remote_blanked = 0    # remote refs replaced so they cannot fire
+        self.fetch_remote = fetch_remote
+        self.vendored = []         # remote libraries embedded at build time
 
         for dirpath, _d, names in os.walk(self.root):
             for n in names:
@@ -224,11 +277,16 @@ class Builder(object):
                 return tag
             k = self.norm(ed, hm.group(1))
             if k is None:
-                # a stylesheet on a CDN cannot be fetched; drop the tag so it
-                # does not produce a request and a console error
                 if re.search(r'rel\s*=\s*["\'][^"\']*stylesheet', tag, re.I) \
                         and hm.group(1).lower().startswith(('http', '//')):
-                    self.notes.append('dropped external stylesheet: ' + hm.group(1))
+                    href = hm.group(1)
+                    if not is_telemetry(href) and self.fetch_remote:
+                        data = fetch_remote(href)
+                        if data:
+                            self.vendored.append(href)
+                            return ('<style>/* wathb vendored: %s */\n%s\n</style>'
+                                    % (href, data.decode('utf-8', 'replace')))
+                    self.notes.append('dropped external stylesheet: ' + href)
                     return '<!-- wathb: external stylesheet dropped -->'
                 return tag
             rm = re.search(r'rel\s*=\s*["\']([^"\']+)["\']', tag, re.I)
@@ -245,7 +303,21 @@ class Builder(object):
             k = self.norm(ed, src)
             if k is None:
                 if src.lower().startswith(('http', '//')):
-                    self.notes.append('dropped external script: ' + src)
+                    if is_telemetry(src):
+                        self.notes.append('dropped telemetry script: ' + src)
+                        return '<!-- wathb: telemetry script dropped -->'
+                    # A real library the app needs (jQuery and friends).
+                    # Fetching it HERE is not a contradiction of "no network":
+                    # the finished file needs none, and resolving dependencies
+                    # is what a build step is for.
+                    data = fetch_remote(src) if self.fetch_remote else None
+                    if data:
+                        self.vendored.append(src)
+                        js = re.sub(r'</(script)', r'<\\/\1',
+                                    data.decode('utf-8', 'replace'), flags=re.I)
+                        return ('<script>\n/* wathb vendored at build time: %s */\n%s\n</script>'
+                                % (src, js))
+                    self.notes.append('dropped external script (unfetchable): ' + src)
                     return '<!-- wathb: external script dropped -->'
                 return tag
             self.inlined.add(k)
@@ -408,6 +480,7 @@ class Builder(object):
             'b64Chunks': len(chunks),
             'missingRefs': sorted(set(self.missing)),
             'remoteBlanked': self.remote_blanked,
+            'vendored': sorted(set(self.vendored)),
             'notes': self.notes,
         }
         if self.verbose:
@@ -436,10 +509,13 @@ def main():
     ap.add_argument('--loud', action='store_true',
                     help='let missing files 404 instead of synthesizing')
     ap.add_argument('--max-mb', type=float, default=HARD_LIMIT / 1048576)
+    ap.add_argument('--no-fetch-remote', action='store_true',
+                    help='do not download remote libraries at build time')
     a = ap.parse_args()
 
     out = a.out or (os.path.basename(os.path.abspath(a.folder)) + '.html')
-    b = Builder(a.folder, entry=a.entry, log=a.log, quiet=not a.loud)
+    b = Builder(a.folder, entry=a.entry, log=a.log, quiet=not a.loud,
+                fetch_remote=not a.no_fetch_remote)
     b.run(out, max_bytes=int(a.max_mb * 1048576))
 
 

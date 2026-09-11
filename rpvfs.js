@@ -175,7 +175,17 @@
     }
   }
 
+  /* A URL the PAGE made itself — blob: or data: — is real and must reach the
+     native implementation. Synthesizing over it breaks every app that
+     assembles an asset and then fetches it back: Brotato merges its wasm
+     from .partN files into a Blob, re-fetches it, and got an empty buffer.
+     `WebAssembly.instantiate(): BufferSource argument is empty` was this. */
+  function isPageOwned(url) {
+    return /^(blob|data):/i.test(String(url));
+  }
+
   function responseFor(url) {
+    if (isPageOwned(url)) return null;      // pass through to the real fetch
     var key = toKey(url);
     if (key) {
       log('serve', url, '->', key);
@@ -322,6 +332,23 @@
   };
   XHR.prototype.send = function () {
     var self = this, key = toKey(this._url), data, mime;
+    // blob:/data: belong to the page; hand them to the real XHR
+    if (!key && isPageOwned(this._url)) {
+      var passthru = new OrigXHR();
+      passthru.open(this._method, this._url, this._async !== false);
+      if (this.responseType) { try { passthru.responseType = this.responseType; } catch (e) { } }
+      passthru.onload = function () {
+        own(self, 'status', passthru.status);
+        own(self, 'statusText', passthru.statusText);
+        own(self, 'response', passthru.response);
+        try { own(self, 'responseText', passthru.responseText); } catch (e) { }
+        own(self, 'readyState', 4);
+        self._fire('readystatechange'); self._fire('load'); self._fire('loadend');
+      };
+      passthru.onerror = function () { self._fire('error'); self._fire('loadend'); };
+      passthru.send();
+      return;
+    }
     if (key) { data = bytesOf(key); mime = mimeOf(key); }
     else if (QUIET) {
       var s = synth(this._url);
@@ -600,18 +627,103 @@
     window.Worker.prototype = OrigWorker.prototype;
   }
 
+  /* ── the app's own `new URL(x, base)` calls ───────────────────────────
+     App code does this constantly, and in a blob document it throws
+     "Failed to construct 'URL': Invalid base URL" — Unity's JobScheduler
+     hits it in CreateWorker before the engine ever starts. Falling back to a
+     synthetic base keeps that code running; nothing is fetched from the
+     fallback origin because every load path is already intercepted.
+     Installed AFTER our own BASE probe, which must be allowed to fail. */
+  if (window.URL) {
+    var NativeURL = window.URL;
+    var FALLBACK_BASE = 'https://wathb.invalid/';
+    var PatchedURL = function (url, base) {
+      try {
+        return arguments.length < 2 ? new NativeURL(url) : new NativeURL(url, base);
+      } catch (e) {
+        try { return new NativeURL(url, FALLBACK_BASE); } catch (e2) { throw e; }
+      }
+    };
+    PatchedURL.prototype = NativeURL.prototype;
+    PatchedURL.createObjectURL = function (o) { return NativeURL.createObjectURL(o); };
+    PatchedURL.revokeObjectURL = function (u) { return NativeURL.revokeObjectURL(u); };
+    if (NativeURL.canParse) {
+      PatchedURL.canParse = function () { return true; };
+    }
+    try { window.URL = PatchedURL; } catch (e) { /* frozen */ }
+  }
+
+  /* ── stand-ins for the third-party SDKs the builder removed ───────────
+     Ad and analytics scripts are dropped at build time (they exist only to
+     reach the network, and embedding them would put the requests straight
+     back). Their globals are still referenced by the app's own bundled code,
+     though, and `google is not defined` kills the frame it is thrown in.
+     A permissive no-op absorbs any call, property access or construction. */
+  if (typeof Proxy === 'function') {
+    var STUB = new Proxy(function () { }, {
+      get: function (t, prop) {
+        if (prop === Symbol.toPrimitive) return function () { return ''; };
+        if (prop === Symbol.iterator) return undefined;
+        if (prop === 'toString' || prop === 'valueOf') return function () { return ''; };
+        if (prop === 'length') return 0;
+        // stay awaitable: sdk.init().then(cb) is a very common shape, and a
+        // missing `then` would throw while a never-settling one would hang
+        if (prop === 'then') {
+          return function (res) {
+            if (typeof res === 'function') setTimeout(function () { res(undefined); }, 0);
+            return STUB;
+          };
+        }
+        return STUB;
+      },
+      set: function () { return true; },
+      has: function () { return true; },
+      apply: function () { return STUB; },
+      construct: function () { return STUB; },
+    });
+    ['google', 'googletag', 'gtag', 'ga', '_gaq', 'fbq', 'PokiSDK', 'CrazyGames',
+      'Crazygames', 'GameAnalytics', 'GameMonetize', 'adsbygoogle', 'aiptag',
+      'ramp', 'cookieconsent'].forEach(function (name) {
+        if (typeof window[name] === 'undefined') {
+          try { window[name] = STUB; } catch (e) { /* non-writable */ }
+        }
+      });
+    // these two are conventionally real values, not objects
+    if (!Array.isArray(window.dataLayer)) { try { window.dataLayer = []; } catch (e) { } }
+    window.__wathbStub = STUB;
+  }
+
   /* ── things that only exist to reach the network ──────────────────── */
   if (navigator.sendBeacon) navigator.sendBeacon = function () { return true; };
-  if (navigator.serviceWorker && navigator.serviceWorker.register) {
-    // a service worker cannot be registered from a single file, and the
-    // rejection surfaces as an uncaught error in most engines
-    navigator.serviceWorker.register = function () {
-      return Promise.resolve({
-        scope: (BASE && BASE.href) || './', active: null, installing: null, waiting: null,
-        addEventListener: function () { }, update: function () { return Promise.resolve(); },
-        unregister: function () { return Promise.resolve(true); },
-      });
+  /* Service workers cannot exist here at all. In a blob: document the origin
+     is opaque ("null"), so every call throws SecurityError -- not just
+     register(): Godot's loader calls getRegistrations() and dies on it.
+     Replace the whole interface with something inert that resolves. */
+  if (navigator.serviceWorker) {
+    var fakeReg = {
+      scope: (BASE && BASE.href) || './',
+      active: null, installing: null, waiting: null,
+      addEventListener: function () { }, removeEventListener: function () { },
+      update: function () { return Promise.resolve(); },
+      unregister: function () { return Promise.resolve(true); },
     };
+    var swStub = {
+      controller: null,
+      ready: new Promise(function () { }),   // never settles, like a real page with no SW
+      register: function () { return Promise.resolve(fakeReg); },
+      getRegistration: function () { return Promise.resolve(undefined); },
+      getRegistrations: function () { return Promise.resolve([]); },
+      startMessages: function () { },
+      addEventListener: function () { }, removeEventListener: function () { },
+      dispatchEvent: function () { return true; },
+    };
+    try {
+      Object.defineProperty(navigator, 'serviceWorker', {
+        configurable: true, get: function () { return swStub; },
+      });
+    } catch (e) {
+      try { navigator.serviceWorker.register = swStub.register; } catch (e2) { }
+    }
   }
 
   window.WATHB = {
