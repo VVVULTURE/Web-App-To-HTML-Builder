@@ -300,6 +300,36 @@ class Builder(object):
 
         return self.CSS_URL.sub(do_url, self.CSS_IMPORT.sub(do_import, css))
 
+    def vendor_css(self, css, css_url):
+        """Resolve a vendored stylesheet's own url() references.
+
+        They are relative to where the stylesheet LIVED, not to us: Font
+        Awesome's CSS asks for `../webfonts/fa-solid-900.woff2`, which means
+        nothing locally and shows up as 30 unresolved references per game.
+        Fetch each one against the stylesheet's real URL and inline it.
+        """
+        from urllib.parse import urljoin
+
+        def do_url(m):
+            ref = m.group(1).strip().strip('\'"')
+            if ref.lower().startswith(('data:', 'blob:', '#')):
+                return m.group(0)
+            abs_url = urljoin(css_url if not css_url.startswith('//')
+                              else 'https:' + css_url, ref.split('#')[0])
+            if is_telemetry(abs_url):
+                return 'url("%s")' % blank_for(ref)
+            data = fetch_remote(abs_url, timeout=15)
+            if not data:
+                # nothing to serve it from; a blank of the right kind keeps
+                # the browser from logging a decode failure
+                self.remote_blanked += 1
+                return 'url("%s")' % blank_for(ref)
+            mime = mime_of(abs_url.split('?')[0])
+            return 'url("data:%s;base64,%s")' % (
+                mime, base64.b64encode(data).decode('ascii'))
+
+        return self.CSS_URL.sub(do_url, css)
+
     # ── HTML ──────────────────────────────────────────────────────────
     def nested_boot(self):
         """Bootstrap for a document embedded with srcdoc.
@@ -376,10 +406,17 @@ class Builder(object):
                         data = fetch_remote(href)
                         if data:
                             self.vendored.append(href)
+                            css = self.vendor_css(decode_text(data), href)
                             return ('<style>/* wathb vendored: %s */\n%s\n</style>'
-                                    % (href, decode_text(data)))
+                                    % (href, css))
                     self.notes.append('dropped external stylesheet: ' + href)
                     return '<!-- wathb: external stylesheet dropped -->'
+                # a local stylesheet that is not there: same reasoning as a
+                # missing local script -- the parser requests it before any
+                # hook exists, so dropping it is the only quiet outcome
+                if re.search(r'rel\s*=\s*["\'][^"\']*stylesheet', tag, re.I):
+                    self.notes.append('dropped missing local stylesheet: ' + hm.group(1))
+                    return '<!-- wathb: missing local stylesheet dropped -->'
                 return tag
             rm = re.search(r'rel\s*=\s*["\']([^"\']+)["\']', tag, re.I)
             rel = (rm.group(1) if rm else '').lower()
