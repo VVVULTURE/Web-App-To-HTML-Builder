@@ -58,22 +58,29 @@ def main():
         label = '%s/%s' % (tab, name)
         print('[%3d/%d] %s' % (i, len(targets), label))
         size = dir_size(gp)
+
+        # Size is checked FIRST: constructing a Builder reads every file into
+        # memory, and the largest folders here are multiple GB.
+        if size > max_bytes:
+            msg = ('%.0f MiB of assets exceeds the %.0f MiB single-file ceiling'
+                   % (size / 1048576, max_bytes / 1048576))
+            print('        SKIP  %s' % msg)
+            skipped.append({'game': label, 'reason': msg, 'bytes': size})
+            continue
+
         try:
             b = Builder(gp, verbose=False)
         except SystemExit as e:
             print('        SKIP  %s' % e)
             skipped.append({'game': label, 'reason': str(e), 'bytes': size})
             continue
+        except MemoryError:
+            print('        SKIP  out of memory reading the folder')
+            skipped.append({'game': label, 'reason': 'MemoryError', 'bytes': size})
+            continue
         except Exception as e:
             print('        FAIL  %s' % e)
             failed.append({'game': label, 'error': repr(e)})
-            continue
-
-        if size > max_bytes:
-            msg = ('%.0f MiB of assets exceeds the %.0f MiB single-file ceiling'
-                   % (size / 1048576, max_bytes / 1048576))
-            print('        SKIP  %s' % msg)
-            skipped.append({'game': label, 'reason': msg, 'bytes': size})
             continue
 
         safe = name.replace(' ', '_').replace('+', 'plus')

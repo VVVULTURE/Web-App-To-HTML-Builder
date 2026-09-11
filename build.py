@@ -51,6 +51,40 @@ MIME = {
 }
 EXTERNAL = ('http://', 'https://', '//', 'data:', 'blob:', 'javascript:',
             'mailto:', '#', 'about:', 'ws:', 'wss:')
+REMOTE = ('http://', 'https://', '//')
+
+# A 1x1 transparent PNG. Substituted for any remote image the file cannot
+# carry: it occupies the same slot, renders nothing, and — the point —
+# issues no request. CSS url() is the case that forces this, because
+# stylesheets are not interceptable at runtime the way elements are.
+BLANK_PNG = ('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf'
+             'FcSJAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=')
+
+
+def is_remote(ref):
+    return bool(ref) and ref.strip().strip('\'"').lower().startswith(REMOTE)
+
+
+def blank_for(ref):
+    """A substitute of the right *kind* for a remote reference we cannot keep.
+
+    A transparent PNG standing in for a font makes the browser log a decode
+    failure, which is the sort of console noise this whole tool exists to
+    avoid — so the substitute has to match the extension.
+    """
+    ext = (str(ref).split('?')[0].split('#')[0].rsplit('.', 1) + [''])[1].lower()
+    if ext in ('woff', 'woff2', 'ttf', 'otf', 'eot'):
+        return 'data:font/woff2;base64,'
+    if ext in ('mp3', 'wav', 'ogg', 'm4a', 'aac'):
+        return ('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhY'
+                'AQACABAAZGF0YQAAAAA=')
+    if ext in ('mp4', 'webm'):
+        return 'data:video/mp4;base64,'
+    if ext in ('css',):
+        return 'data:text/css,'
+    if ext in ('js', 'mjs'):
+        return 'data:text/javascript,'
+    return BLANK_PNG
 
 
 def mime_of(p):
@@ -81,6 +115,7 @@ class Builder(object):
         self.inlined = set()
         self.missing = []          # refs the app names that do not exist
         self.notes = []
+        self.remote_blanked = 0    # remote refs replaced so they cannot fire
 
         for dirpath, _d, names in os.walk(self.root):
             for n in names:
@@ -140,8 +175,15 @@ class Builder(object):
             return self.inline_css(k, seen)
 
         def do_url(m):
-            k = self.norm(d, m.group(1))
+            ref = m.group(1)
+            k = self.norm(d, ref)
             if k is None:
+                # A stylesheet is not interceptable at runtime, so a remote
+                # url() would fire a real request no matter what the shim
+                # does. Blank it here or it never becomes self-contained.
+                if is_remote(ref):
+                    self.remote_blanked += 1
+                    return 'url("%s")' % blank_for(ref)
                 return m.group(0)
             self.inlined.add(k)
             return 'url("%s")' % self.data_uri(k)
@@ -216,6 +258,10 @@ class Builder(object):
                     continue
                 k = self.norm(ed, mm.group(1))
                 if not k:
+                    if is_remote(mm.group(1)):
+                        self.remote_blanked += 1
+                        out = out.replace(mm.group(0),
+                                          '%s="%s"' % (attr, blank_for(mm.group(1))))
                     continue
                 if len(self.vfs[k]) <= INLINE_MAX:
                     self.inlined.add(k)
@@ -237,6 +283,9 @@ class Builder(object):
                     if k and len(self.vfs[k]) <= INLINE_MAX:
                         self.inlined.add(k)
                         bits[0] = self.data_uri(k)
+                    elif not k and is_remote(bits[0]):
+                        self.remote_blanked += 1
+                        bits[0] = blank_for(bits[0])
                     parts.append(' '.join(bits))
                 out = out.replace(sm.group(0), 'srcset="%s"' % ', '.join(parts))
             return out
@@ -252,6 +301,9 @@ class Builder(object):
             def do_url(mm):
                 k = self.norm(ed, mm.group(1))
                 if k is None:
+                    if is_remote(mm.group(1)):
+                        self.remote_blanked += 1
+                        return 'url("%s")' % blank_for(mm.group(1))
                     return mm.group(0)
                 self.inlined.add(k)
                 return 'url("%s")' % self.data_uri(k)
@@ -320,6 +372,7 @@ class Builder(object):
             'outBytes': os.path.getsize(out_path),
             'b64Chunks': len(chunks),
             'missingRefs': sorted(set(self.missing)),
+            'remoteBlanked': self.remote_blanked,
             'notes': self.notes,
         }
         if self.verbose:

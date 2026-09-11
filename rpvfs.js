@@ -288,9 +288,122 @@
     var n = String(name).toLowerCase();
     if (n === 'src' || n === 'href' || n === 'poster' || n === 'data') {
       try { value = rewrite(value); } catch (e) { /* keep original */ }
+    } else if (n === 'style') {
+      try { value = rewriteCssValue(value); } catch (e) { /* keep original */ }
+    } else if (n === 'srcset') {
+      try {
+        value = String(value).split(',').map(function (part) {
+          var bits = part.trim().split(/\s+/);
+          if (bits[0]) bits[0] = rewrite(bits[0]);
+          return bits.join(' ');
+        }).join(', ');
+      } catch (e) { /* keep original */ }
     }
     return origSet.call(this, name, value);
   };
+
+  /* ── CSS values assigned from script ──────────────────────────────
+     `el.style.backgroundImage = 'url(' + someUrl + ')'` is neither an
+     attribute nor a fetch, so nothing above sees it — and bundlers emit
+     exactly this shape constantly. Rewrite url() inside the value. */
+  var URL_IN_VALUE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+  function rewriteCssValue(v) {
+    if (typeof v !== 'string' || v.indexOf('url(') < 0) return v;
+    return v.replace(URL_IN_VALUE, function (whole, q, ref) {
+      if (/^(data|blob):/i.test(ref)) return whole;
+      return 'url("' + rewrite(ref) + '")';
+    });
+  }
+
+  var CSS_PROPS = ['background', 'backgroundImage', 'borderImage',
+    'borderImageSource', 'listStyleImage', 'maskImage', 'webkitMaskImage',
+    'content', 'cursor', 'shapeOutside', 'src', 'filter', 'clipPath',
+    'offsetPath', 'webkitBoxReflect'];
+  if (window.CSSStyleDeclaration) {
+    var CSD = window.CSSStyleDeclaration.prototype;
+    var kebab = function (p) {
+      return p.replace(/^webkit/, '-webkit-')
+        .replace(/[A-Z]/g, function (c) { return '-' + c.toLowerCase(); });
+    };
+    // Blink installs CSS property accessors LAZILY as own properties of each
+    // style object, so getOwnPropertyDescriptor on the prototype reports
+    // nothing and a descriptor-guarded patch silently does nothing. Define
+    // them outright instead, backed by the real setProperty. This runs before
+    // any app code, so no instance has shadowed them yet.
+    CSS_PROPS.forEach(function (prop) {
+      var css = kebab(prop);
+      try {
+        Object.defineProperty(CSD, prop, {
+          configurable: true, enumerable: false,
+          get: function () { return this.getPropertyValue(css); },
+          set: function (v) { this.setProperty(css, rewriteCssValue(String(v))); },
+        });
+      } catch (e) { /* property is not configurable here */ }
+    });
+    var origSetProp = CSD.setProperty;
+    CSD.setProperty = function (name, value, priority) {
+      return origSetProp.call(this, name, rewriteCssValue(value), priority);
+    };
+    var cssTextDesc = Object.getOwnPropertyDescriptor(CSD, 'cssText');
+    if (cssTextDesc && cssTextDesc.set) {
+      Object.defineProperty(CSD, 'cssText', {
+        configurable: true, enumerable: cssTextDesc.enumerable,
+        get: function () { return cssTextDesc.get.call(this); },
+        set: function (v) { cssTextDesc.set.call(this, rewriteCssValue(v)); },
+      });
+    }
+  }
+  if (window.CSSStyleSheet) {
+    var origInsert = window.CSSStyleSheet.prototype.insertRule;
+    if (origInsert) {
+      window.CSSStyleSheet.prototype.insertRule = function (rule, index) {
+        return origInsert.call(this, rewriteCssValue(rule), index);
+      };
+    }
+  }
+
+  /* CSS text poured into a dynamically created <style> element.
+     Styling libraries (JSS / styled-components / emotion) build a rule as a
+     string and assign it as the element's text — no attribute, no fetch, no
+     setProperty, so every hook above misses it, and the image request fires
+     on the next style recalc. */
+  var isStyle = function (n) { return n && n.tagName === 'STYLE'; };
+
+  function patchTextSink(proto, prop, guard) {
+    if (!proto) return;
+    var d = Object.getOwnPropertyDescriptor(proto, prop);
+    if (!d || !d.set) return;
+    Object.defineProperty(proto, prop, {
+      configurable: true, enumerable: d.enumerable,
+      get: function () { return d.get ? d.get.call(this) : undefined; },
+      set: function (v) {
+        try { if (guard(this)) v = rewriteCssValue(String(v)); } catch (e) { }
+        return d.set.call(this, v);
+      },
+    });
+  }
+  patchTextSink(window.Node && window.Node.prototype, 'textContent', isStyle);
+  patchTextSink(window.Element && window.Element.prototype, 'innerHTML', isStyle);
+  patchTextSink(window.HTMLElement && window.HTMLElement.prototype, 'innerText', isStyle);
+  // a text node whose parent is a <style>
+  patchTextSink(window.CharacterData && window.CharacterData.prototype, 'data',
+    function (n) { return isStyle(n.parentNode); });
+  patchTextSink(window.Node && window.Node.prototype, 'nodeValue',
+    function (n) { return isStyle(n.parentNode); });
+
+  ['appendChild', 'insertBefore', 'replaceChild'].forEach(function (fn) {
+    var orig = window.Node && window.Node.prototype[fn];
+    if (!orig) return;
+    window.Node.prototype[fn] = function (node) {
+      try {
+        if (isStyle(this) && node && node.nodeType === 3 && node.data
+            && node.data.indexOf('url(') >= 0) {
+          node.data = rewriteCssValue(node.data);
+        }
+      } catch (e) { /* fall through and insert as-is */ }
+      return orig.apply(this, arguments);
+    };
+  });
 
   // `new Audio(url)` sets src inside the constructor, before our setter
   if (window.Audio) {
