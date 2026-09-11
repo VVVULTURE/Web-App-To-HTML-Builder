@@ -118,7 +118,10 @@ def main():
             'portUrl': '%s/blob-harness.html?f=%s' % (a.port_url, os.path.basename(outfile)),
             'baseUrl': entry_url.replace(' ', '%20'),
             'ignore': [fileurl],
-            'wait': 12000 if size < 40 * 1048576 else 24000,
+            # Generous, because a short wait produces FALSE failures, not
+            # fast ones: Basketball Legends was reported "stuck on loader"
+            # purely because 12s was not long enough for it to start.
+            'wait': 18000 if size < 40 * 1048576 else 32000,
         })
 
     report = {'built': built, 'skipped': skipped, 'failed': failed}
