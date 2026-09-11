@@ -133,12 +133,19 @@ async function check(url, waitMs, ignore) {
   sessions.delete(sessionId);
   await send('Target.closeTarget', { targetId });
 
+  // Compare decoded: a game whose name contains an apostrophe arrives as
+  // Baldi%27s and silently fails an exact match, which reports the harness's
+  // own fetch as though the port had reached the network.
+  const dec = (s) => { try { return decodeURIComponent(s); } catch { return s; } };
+  const ignores = (ignore || []).map(dec);
+  const selfUrl = dec(url);
   const sub = [...new Set(reqs)].filter((u) => {
     if (u.startsWith('data:') || u.startsWith('blob:')) return false;
-    if (u === url) return false;
+    const d = dec(u);
+    if (d === selfUrl || d.split('?')[0] === selfUrl.split('?')[0]) return false;
     // the blob harness fetches the file under test; that is the harness, not
     // the port, and it does not exist once Red Portal serves the html itself
-    return !(ignore || []).some((ig) => u === ig || u.split('?')[0] === ig);
+    return !ignores.some((ig) => d === ig || d.split('?')[0] === ig);
   });
   let info = {};
   try { info = JSON.parse(probe.result?.result?.value || '{}'); } catch { }

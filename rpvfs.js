@@ -359,6 +359,12 @@
     if (key) { data = bytesOf(key); mime = mimeOf(key); }
     else if (QUIET) {
       var s = synth(this._url);
+      // The caller told us it wants JSON; an empty body would give it
+      // "Unexpected end of JSON input" instead of a harmless empty object.
+      // The extension often does not say -- plenty of endpoints have none.
+      if (this.responseType === 'json' && typeof s.body !== 'string') {
+        s = { body: '{}', mime: 'application/json' };
+      }
       data = typeof s.body === 'string' ? new TextEncoder().encode(s.body) : s.body;
       mime = s.mime;
     } else {
@@ -386,7 +392,30 @@
       set: function (v) { d.set.call(this, rewrite(v)); },
     });
   }
-  [[window.HTMLScriptElement, 'src'], [window.HTMLImageElement, 'src'],
+
+  /* An inlined script reports src === '', and bundlers depend on it.
+     Webpack's "publicPath: auto" reads document.currentScript.src to work out
+     where its chunks live and THROWS "Automatic publicPath is not supported
+     in this browser" when it is empty. Report a synthetic URL instead: the
+     chunk requests that follow come back through toKey(), which strips the
+     origin and resolves them out of the payload by path. */
+  var SYNTH_ORIGIN = 'https://wathb.invalid/';
+  if (window.HTMLScriptElement) {
+    var sd = Object.getOwnPropertyDescriptor(window.HTMLScriptElement.prototype, 'src');
+    if (sd && sd.get) {
+      Object.defineProperty(window.HTMLScriptElement.prototype, 'src', {
+        configurable: true, enumerable: sd.enumerable,
+        get: function () {
+          var v = sd.get.call(this);
+          if (v) return v;
+          return this.hasAttribute('src') ? v : SYNTH_ORIGIN + 'wathb-inline.js';
+        },
+        set: function (v) { sd.set.call(this, rewrite(v)); },
+      });
+    }
+  }
+  // HTMLScriptElement.src is handled above, with a getter as well as a setter
+  [[window.HTMLImageElement, 'src'],
   [window.HTMLMediaElement, 'src'], [window.HTMLSourceElement, 'src'],
   [window.HTMLLinkElement, 'href'], [window.HTMLIFrameElement, 'src'],
   [window.HTMLEmbedElement, 'src'], [window.HTMLObjectElement, 'data'],
@@ -671,6 +700,28 @@
     try { window.URL = PatchedURL; } catch (e) { /* frozen */ }
   }
 
+  // `new Request('models/car.glb')` fails the same way and for the same
+  // reason -- it resolves against the document base, which a blob has none
+  // of. Polytrack builds every asset request this way.
+  if (window.Request) {
+    var NativeRequest = window.Request;
+    var PatchedRequest = function (input, init) {
+      try {
+        return new NativeRequest(input, init);
+      } catch (e) {
+        if (typeof input === 'string') {
+          try {
+            return new NativeRequest(
+              'https://wathb.invalid/' + String(input).replace(/^\.?\//, ''), init);
+          } catch (e2) { /* fall through to the original error */ }
+        }
+        throw e;
+      }
+    };
+    PatchedRequest.prototype = NativeRequest.prototype;
+    try { window.Request = PatchedRequest; } catch (e) { /* frozen */ }
+  }
+
   /* ── stand-ins for the third-party SDKs the builder removed ───────────
      Ad and analytics scripts are dropped at build time (they exist only to
      reach the network, and embedding them would put the requests straight
@@ -689,6 +740,20 @@
         if (prop === 'then') {
           return function (res) {
             if (typeof res === 'function') setTimeout(function () { res(undefined); }, 0);
+            return STUB;
+          };
+        }
+        // Fire whatever the app registers. Ad SDKs are a GATE, not a
+        // decoration: a preroll game calls requestAds() and starts only from
+        // the resulting callback, so a stub that merely absorbs the listener
+        // leaves it on "Loading..." for ever. Moto X3M hung exactly here.
+        if (prop === 'addEventListener' || prop === 'addListener'
+            || prop === 'on' || prop === 'once') {
+          return function (_type, cb) {
+            var fn = typeof _type === 'function' ? _type : cb;
+            if (typeof fn === 'function') setTimeout(function () {
+              try { fn(STUB); } catch (e) { /* the app's own handler */ }
+            }, 0);
             return STUB;
           };
         }
