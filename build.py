@@ -411,7 +411,12 @@ class Builder(object):
                                 % (src, js))
                     self.notes.append('dropped external script (unfetchable): ' + src)
                     return '<!-- wathb: external script dropped -->'
-                return tag
+                # A local path that does not exist. The parser sets this src
+                # itself, so no runtime hook can reach it: over http it is a
+                # guaranteed 404 and in a blob document it fails silently.
+                # Dropping it is the only outcome with no error.
+                self.notes.append('dropped missing local script: ' + src)
+                return '<!-- wathb: missing local script dropped -->'
             self.inlined.add(k)
             body = decode_text(self.vfs[k])
             # a literal </script> in the JS would close the tag early
@@ -445,9 +450,15 @@ class Builder(object):
             return ('<script%s>\n/* wathb: %s */\n%s\n</script>%s'
                     % (attrs, k, body, after))
 
+        # The body is matched as `.*?`, not `\s*`: a <script> may carry BOTH a
+        # src and inline content, and the HTML spec says the content is
+        # ignored when src is present. Requiring an empty body left those tags
+        # untouched -- and a parser-set relative src cannot resolve in a blob
+        # document, so the file simply never loaded, with no request and no
+        # error. Basketball Stars' physics engine vanished exactly this way.
         html = re.sub(
-            r'<script\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\'][^>]*>\s*</script>',
-            sub_script, html, flags=re.I)
+            r'<script\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\'][^>]*>.*?</script>',
+            sub_script, html, flags=re.I | re.S)
 
         def sub_media(m):
             tag, out = m.group(0), m.group(0)
