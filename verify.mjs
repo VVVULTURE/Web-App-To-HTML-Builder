@@ -155,7 +155,16 @@ const norm = (s) => s.replace(/https?:\/\/[^\s)]+/g, '<url>')
 const jobsFile = arg('--jobs');
 const results = [];
 if (jobsFile) {
-  const jobs = JSON.parse(readFileSync(jobsFile, 'utf8'));
+  let jobs = JSON.parse(readFileSync(jobsFile, 'utf8'));
+  // A single browser cannot survive the whole set: these pages run to half a
+  // gigabyte each and it dies of memory exhaustion somewhere around job 70,
+  // after which every remaining job fails for a reason that has nothing to do
+  // with the game. Run a slice per process and let the driver recycle it.
+  const slice = arg('--slice');
+  if (slice) {
+    const [a0, b0] = slice.split(':').map(Number);
+    jobs = jobs.slice(a0, b0);
+  }
   const CONC = Number(arg('--concurrency', 4));
 
   // Baselines describe the ORIGINAL game, which does not change between
