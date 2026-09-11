@@ -137,6 +137,25 @@ def fetch_remote(url, timeout=20):
     return data
 
 
+def decode_text(data):
+    """Decode a file for inlining WITHOUT destroying it.
+
+    `decode('utf-8', 'replace')` turns every invalid byte into U+FFFD, which
+    is irreversible. Plenty of shipped game scripts are Latin-1, and mangling
+    them silently breaks the library they define -- Basketball Stars' physics
+    engine came out undefined this way, with no error pointing at the cause.
+
+    latin-1 maps bytes 1:1 onto U+0000-U+00FF, so the resulting characters
+    are exactly what a browser reading the file as Latin-1 would see, which
+    is what the original page did. Writing them back out as UTF-8 round-trips
+    them intact.
+    """
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        return data.decode('latin-1')
+
+
 def mime_of(p):
     return MIME.get(os.path.splitext(p)[1].lower(), 'application/octet-stream')
 
@@ -185,6 +204,17 @@ class Builder(object):
             raise SystemExit('no entry .html found in %s' % self.root)
         self.entry_dir = posixpath.dirname(self.entry)
 
+        # Some rippers percent-encode the filename when saving, so the page
+        # asks for "Dadish 2 Pk.js" while the file on disk is literally named
+        # "Dadish%202%20Pk.js". Index the decoded form of every key so both
+        # spellings resolve to the same file.
+        from urllib.parse import unquote
+        self.decoded = {}
+        for k in self.vfs:
+            d = unquote(k)
+            if d != k and d not in self.vfs:
+                self.decoded.setdefault(d, k)
+
     # ── reference resolution ──────────────────────────────────────────
     def norm(self, base_dir, ref):
         if not ref:
@@ -201,6 +231,8 @@ class Builder(object):
             key = key[2:]
         if key in self.vfs:
             return key
+        if key in self.decoded:
+            return self.decoded[key]
 
         # Site rippers mirror a remote tree into escaped directory names
         # ("https://host/x@main/" -> "https_/_/host/x_main/"), and the page
@@ -210,11 +242,21 @@ class Builder(object):
         # when exactly one candidate matches -- an ambiguous match would
         # silently serve the wrong file, which is the failure mode this
         # resolver exists to avoid.
-        tail = '/' + key
-        hits = [k for k in self.vfs if k.endswith(tail)]
-        if len(hits) == 1:
-            self.notes.append('resolved by unique suffix: %s -> %s' % (ref, hits[0]))
-            return hits[0]
+        # Try both spellings as a suffix: the entry-dir-joined key, and the
+        # reference exactly as written. The second matters when a <base href>
+        # pointed somewhere else entirely, so the path the page uses has
+        # nothing to do with the entry document's folder.
+        for cand in ([key] if key == bare.lstrip('/') else [key, bare.lstrip('/')]):
+            tail = '/' + cand
+            hits = [k for k in self.vfs if k.endswith(tail)]
+            if len(hits) == 1:
+                self.notes.append('resolved by unique suffix: %s -> %s' % (ref, hits[0]))
+                return hits[0]
+            if not hits:
+                hits = [v for d, v in self.decoded.items() if d.endswith(tail)]
+                if len(hits) == 1:
+                    self.notes.append('resolved by decoded suffix: %s -> %s' % (ref, hits[0]))
+                    return hits[0]
 
         self.missing.append(ref)
         return None
@@ -231,7 +273,7 @@ class Builder(object):
     def inline_css(self, key, seen=None):
         seen = (seen or set()) | {key}
         self.inlined.add(key)
-        css = self.vfs[key].decode('utf-8', 'replace')
+        css = decode_text(self.vfs[key])
         d = posixpath.dirname(key)
 
         def do_import(m):
@@ -259,9 +301,59 @@ class Builder(object):
         return self.CSS_URL.sub(do_url, self.CSS_IMPORT.sub(do_import, css))
 
     # ── HTML ──────────────────────────────────────────────────────────
-    def build_html(self):
-        html = self.vfs[self.entry].decode('utf-8', 'replace')
-        ed = self.entry_dir
+    def nested_boot(self):
+        """Bootstrap for a document embedded with srcdoc.
+
+        It inherits the parent's origin, so it borrows the already-decoded
+        payload through window.parent instead of carrying its own copy.
+        """
+        with open(SHIM, 'r', encoding='utf-8') as fh:
+            shim = fh.read()
+        return ('<meta charset="utf-8">'
+                '<script>(function(){var p=window.parent&&window.parent.__WATHB_SHARE__;'
+                'window.__WATHB__=p?{index:p.index,byName:p.byName,alias:p.alias,'
+                'bytes:p.bytes,quiet:true}:{index:{},payload:[]};})();</script>'
+                '<script>' + shim + '</script>')
+
+    def build_html(self, entry=None, depth=0):
+        entry = entry or self.entry
+        html = decode_text(self.vfs[entry])
+        ed = posixpath.dirname(entry)
+
+        # An <iframe> pointing at a local page is its OWN document: our hooks
+        # do not reach inside it, and turning it into a data: URL (which is
+        # what the generic media path did) leaves it with no runtime at all --
+        # Eggy Car then pulled 79 assets straight off a CDN. Build it properly
+        # and hand it the same filesystem. Nine of these games are wrappers
+        # whose entry is nothing but an iframe.
+        def sub_iframe(m):
+            tag = m.group(0)
+            mm = re.search(r'\bsrc\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+            if not mm or depth >= 3:
+                return tag
+            k = self.norm(ed, mm.group(1))
+            if not k or not k.lower().endswith(('.html', '.htm')):
+                return tag
+            self.inlined.add(k)
+            inner = self.nested_boot() + self.build_html(entry=k, depth=depth + 1)
+            self.notes.append('embedded iframe document: %s' % k)
+
+            # Carried as a payload entry and attached at runtime as a blob
+            # URL, NOT as srcdoc. Escaping a whole document into an attribute
+            # is fragile -- and every transform below matches raw text with
+            # no notion of attribute boundaries, so an inline srcdoc gets
+            # re-processed and mangled. A blob URL needs no escaping, and a
+            # blob iframe inherits this origin, so it can still borrow the
+            # parent's decoded payload.
+            nkey = '__wathb_nested_%d.html' % len(nested)
+            self.vfs[nkey] = inner.encode('utf-8')
+            nested.append(nkey)
+            return re.sub(r'\bsrc\s*=\s*["\'][^"\']+["\']',
+                          lambda _m: 'data-wathb-doc="%s"' % nkey,
+                          tag, flags=re.I, count=1)
+
+        nested = []
+        html = re.sub(r'<iframe\b[^>]*>', sub_iframe, html, flags=re.I)
 
         # A <base> inside the document would re-point every relative URL and
         # break the mapping the runtime relies on.
@@ -285,7 +377,7 @@ class Builder(object):
                         if data:
                             self.vendored.append(href)
                             return ('<style>/* wathb vendored: %s */\n%s\n</style>'
-                                    % (href, data.decode('utf-8', 'replace')))
+                                    % (href, decode_text(data)))
                     self.notes.append('dropped external stylesheet: ' + href)
                     return '<!-- wathb: external stylesheet dropped -->'
                 return tag
@@ -314,14 +406,14 @@ class Builder(object):
                     if data:
                         self.vendored.append(src)
                         js = re.sub(r'</(script)', r'<\\/\1',
-                                    data.decode('utf-8', 'replace'), flags=re.I)
+                                    decode_text(data), flags=re.I)
                         return ('<script>\n/* wathb vendored at build time: %s */\n%s\n</script>'
                                 % (src, js))
                     self.notes.append('dropped external script (unfetchable): ' + src)
                     return '<!-- wathb: external script dropped -->'
                 return tag
             self.inlined.add(k)
-            body = self.vfs[k].decode('utf-8', 'replace')
+            body = decode_text(self.vfs[k])
             # a literal </script> in the JS would close the tag early
             body = re.sub(r'</(script)', r'<\\/\1', body, flags=re.I)
             attrs = ''
@@ -397,7 +489,9 @@ class Builder(object):
                 out = out.replace(sm.group(0), 'srcset="%s"' % ', '.join(parts))
             return out
 
-        html = re.sub(r'<(?:img|source|audio|video|embed|object|track|iframe)\b[^>]*>',
+        # iframes are deliberately absent here -- they were handled above as
+        # documents. Letting the generic path data-URI them is the bug.
+        html = re.sub(r'<(?:img|source|audio|video|embed|object|track)\b[^>]*>',
                       sub_media, html, flags=re.I)
 
         def sub_style_block(m):
@@ -418,19 +512,29 @@ class Builder(object):
 
         html = re.sub(r'<style[^>]*>(.*?)</style>', sub_style_block, html,
                       flags=re.I | re.S)
+
+        # restore embedded iframe documents, now that nothing else will touch
+        for i, doc in enumerate(nested):
+            html = html.replace('@@WATHB_NESTED_%d@@' % i, doc)
         return html
 
     # ── payload + assembly ────────────────────────────────────────────
     def run(self, out_path, max_bytes=HARD_LIMIT):
         html = self.build_html()
 
-        index, blobs, offset, by_name = {}, [], 0, {}
+        from urllib.parse import unquote
+        index, blobs, offset, by_name, alias = {}, [], 0, {}, {}
         for rel in sorted(self.vfs):
             if rel == self.entry or rel in self.inlined:
                 continue
             data = self.vfs[rel]
             index[rel] = [offset, len(data), mime_of(rel)]
             by_name.setdefault(rel.split('/')[-1], []).append(rel)
+            # the decoded spelling is what the page will actually ask for
+            dec = unquote(rel)
+            if dec != rel:
+                alias.setdefault(dec, rel)
+                by_name.setdefault(dec.split('/')[-1], []).append(rel)
             blobs.append(data)
             offset += len(data)
 
@@ -451,11 +555,20 @@ class Builder(object):
         cfg = {
             'index': index,
             'byName': by_name,
+            'alias': alias,
             'payload': chunks,
             'quiet': self.quiet,
             'log': self.log,
         }
-        boot = ('<link rel="icon" href="data:,">\n'
+        # The charset declaration MUST come first and must be within the
+        # first 1024 bytes -- that is all the browser sniffs. Our payload is
+        # megabytes of base64 injected at the top of <head>, which shoves the
+        # document's own <meta charset> far past that window; the browser
+        # then falls back to Latin-1 and every non-ASCII byte is mangled.
+        # That is not cosmetic: it turned a UTF-8 range regex into
+        # "Invalid regular expression: range out of order" and killed the game.
+        boot = ('<meta charset="utf-8">\n'
+                '<link rel="icon" href="data:,">\n'
                 '<script>window.__WATHB__=' + json.dumps(cfg, separators=(',', ':'))
                 + ';</script>\n<script>' + shim + '</script>\n')
 

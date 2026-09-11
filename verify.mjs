@@ -140,12 +140,26 @@ const jobsFile = arg('--jobs');
 const results = [];
 if (jobsFile) {
   const jobs = JSON.parse(readFileSync(jobsFile, 'utf8'));
+  const CONC = Number(arg('--concurrency', 4));
+
+  // Baselines describe the ORIGINAL game, which does not change between
+  // runs. Caching them turns every re-verify into half the work — and
+  // re-verifying is the common case while fixing a class of failures.
+  const cachePath = arg('--baseline-cache', 'baseline-cache.json');
+  let baseCache = {};
+  try { baseCache = JSON.parse(readFileSync(cachePath, 'utf8')); } catch { }
+
   let n = 0;
-  for (const j of jobs) {
-    n++;
+  const runJob = async (j) => {
     const port = await check(j.portUrl, j.wait || 9000, j.ignore);
     let base = null;
-    if (j.baseUrl) base = await check(j.baseUrl, j.wait || 9000, j.ignore);
+    if (j.baseUrl) {
+      if (baseCache[j.baseUrl]) base = baseCache[j.baseUrl];
+      else {
+        base = await check(j.baseUrl, j.wait || 9000, j.ignore);
+        baseCache[j.baseUrl] = base;
+      }
+    }
 
     // only count problems the original did not already have
     const known = new Set([...(base?.errors || []), ...(base?.exceptions || [])].map(norm));
@@ -168,13 +182,33 @@ if (jobsFile) {
       port: { title: port.title, body: port.body, canvas: port.canvas, text: port.text },
       base: base && { title: base.title, body: base.body, canvas: base.canvas,
         text: base.text, requests: base.totalRequests } });
+    n++;
     console.log(`[${String(n).padStart(3)}/${jobs.length}] ${pass ? 'PASS' : 'FAIL'}  ${j.name}`
       + (pass ? '' : `  (${newErrors.length + newExc.length} new err, `
         + `${port.netFail.length} netfail, ${port.subRequests.length} requests`
         + `${stuck ? ', STUCK ON LOADER' : ''})`));
-  }
+  };
+
+  // Simple pool. Each check gets its own target and session, so they are
+  // already independent; the only shared resource is browser memory, which
+  // is why this is a handful of workers and not one per job.
+  const queue = jobs.slice();
+  await Promise.all(Array.from({ length: Math.min(CONC, queue.length) }, async () => {
+    while (queue.length) {
+      const j = queue.shift();
+      try { await runJob(j); }
+      catch (e) {
+        n++;
+        results.push({ name: j.name, pass: false, harnessError: String(e).slice(0, 200) });
+        console.log(`[${String(n).padStart(3)}/${jobs.length}] FAIL  ${j.name}  (harness: ${String(e).slice(0, 80)})`);
+      }
+    }
+  }));
+
   const out = arg('--out', 'verify-report.json');
+  results.sort((a, b) => a.name.localeCompare(b.name));
   writeFileSync(out, JSON.stringify(results, null, 2));
+  try { writeFileSync(cachePath, JSON.stringify(baseCache)); } catch { }
   const passed = results.filter((r) => r.pass).length;
   console.log(`\n${passed}/${results.length} passed  ->  ${out}`);
 } else {

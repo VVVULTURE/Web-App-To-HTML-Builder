@@ -42,6 +42,10 @@
 
   /* ── payload: one pass over the concatenated base64 ───────────────── */
   (function decode() {
+    // A nested document (an iframe built with srcdoc) inherits the parent's
+    // origin, so it can borrow the already-decoded bytes instead of carrying
+    // a second copy of a payload that may be hundreds of megabytes.
+    if (CFG.bytes) { BYTES = CFG.bytes; return; }
     var chunks = CFG.payload || [];
     if (typeof chunks === 'string') chunks = [chunks];
     var bins = [], total = 0, i, k;
@@ -119,6 +123,9 @@
     }
 
     if (INDEX[path]) return path;
+    // Rippers that percent-encode the filename when saving: the page asks
+    // for "Dadish 2 Pk.js", the file is named "Dadish%202%20Pk.js".
+    if (CFG.alias && CFG.alias[path]) return CFG.alias[path];
 
     // Mirrored trees: the app asks for the path its original <base href>
     // made resolve, while the file sits under an escaped mirror directory.
@@ -519,6 +526,17 @@
 
   /* ── static refs the builder deferred (too large to inline twice) ─── */
   function hydrate() {
+    // An embedded iframe document: attach it as a blob URL. It inherits this
+    // origin, so its own runtime can borrow __WATHB_SHARE__ from the parent
+    // rather than carrying a second copy of the payload.
+    var docs = document.querySelectorAll('[data-wathb-doc]');
+    for (var d = 0; d < docs.length; d++) {
+      var dkey = docs[d].getAttribute('data-wathb-doc');
+      if (INDEX[dkey]) {
+        origSet.call(docs[d], 'src', blobFor(dkey));
+        docs[d].removeAttribute('data-wathb-doc');
+      }
+    }
     ['src', 'poster', 'data', 'href'].forEach(function (attr) {
       var nodes = document.querySelectorAll('[data-wathb-' + attr + ']');
       for (var i = 0; i < nodes.length; i++) {
@@ -732,6 +750,10 @@
     read: function (p) { var k = toKey(p); return k ? bytesOf(k) : null; },
     url: function (p) { var k = toKey(p); return k ? blobFor(k) : null; },
     size: BYTES.length,
+  };
+  // what a nested srcdoc document picks up instead of its own payload
+  window.__WATHB_SHARE__ = {
+    index: INDEX, byName: CFG.byName || {}, alias: CFG.alias || {}, bytes: BYTES,
   };
   log('installed');
 })();
