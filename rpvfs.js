@@ -7,10 +7,14 @@
 
    Why it is not simpler
    ────────────────────
-   · Paths resolve through `new URL(ref, base)` — the algorithm the browser
-     itself uses — not by substring or basename matching. Two files named
-     `data.json` in different folders are different files; fuzzy matching
-     silently serves the wrong one.
+   · Paths resolve LEXICALLY to a full VFS key, not by substring or basename
+     matching. Two files named `data.json` in different folders are different
+     files; fuzzy matching silently serves the wrong one. Lexically rather
+     than via `new URL(ref, base)` because the base is frequently unusable:
+     in a blob: document — which is how Red Portal runs every game —
+     `new URL('.', document.baseURI)` THROWS, since blob URLs are opaque
+     rather than hierarchical. Anything that assumes a resolvable base dies
+     before a single hook is installed and takes the whole app with it.
    · Property setters on element prototypes are patched, not a
      MutationObserver: the browser starts fetching the instant `img.src =`
      is assigned, and an observer runs a microtask too late to stop it.
@@ -56,8 +60,31 @@
   })();
   log('payload', BYTES.length, 'bytes /', Object.keys(INDEX).length, 'files');
 
-  /* ── key resolution ───────────────────────────────────────────────── */
-  var BASE = new URL('.', document.baseURI);
+  /* ── key resolution ───────────────────────────────────────────────────
+     A blob: document has NO base to resolve against. `new URL('.', blobUrl)`
+     throws outright, and so does `new URL('some/relative/path', blobUrl)` —
+     blob URLs are opaque, not hierarchical. Red Portal runs every game in a
+     blob tab, so this is the normal case here, not an edge case: any
+     dependence on document.baseURI has to be optional. Paths are resolved
+     lexically instead, which is what the VFS keys are anyway. */
+  var BASE = null;
+  try {
+    var b = new URL('.', document.baseURI);
+    if (b.protocol === 'http:' || b.protocol === 'https:' || b.protocol === 'file:') BASE = b;
+  } catch (e) { BASE = null; }
+
+  function lexical(p) {
+    p = String(p).split('#')[0].split('?')[0].replace(/\\/g, '/');
+    try { p = decodeURIComponent(p); } catch (e) { /* leave as written */ }
+    var parts = p.split('/'), out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i];
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') { out.pop(); continue; }
+      out.push(seg);
+    }
+    return out.join('/');
+  }
 
   function toKey(url) {
     if (url == null) return null;
@@ -67,24 +94,49 @@
       else url = String(url);
     }
     if (/^(data|blob|javascript|about|mailto|ws|wss):/i.test(url)) return null;
-    var abs;
-    try { abs = new URL(url, document.baseURI); } catch (e) { return null; }
 
-    var path = decodeURIComponent(abs.pathname);
-    if (abs.origin === BASE.origin) {
-      var bp = decodeURIComponent(BASE.pathname);
-      path = path.indexOf(bp) === 0 ? path.slice(bp.length) : path.replace(/^\/+/, '');
+    var path;
+    if (/^(https?:)?\/\//i.test(url)) {
+      // absolute: an app hardcoding its own CDN. Resolve against its own
+      // origin and keep the path tail.
+      var abs;
+      try { abs = new URL(url.indexOf('//') === 0 ? 'https:' + url : url); }
+      catch (e) { return null; }
+      path = lexical(abs.pathname);
+      if (BASE && abs.origin === BASE.origin) {
+        var bp = lexical(BASE.pathname);
+        if (bp && path.indexOf(bp + '/') === 0) path = path.slice(bp.length + 1);
+        else if (bp && path === bp) path = '';
+      }
+    } else if (url.charAt(0) === '/') {
+      path = lexical(url);
+      if (BASE) {
+        var bp2 = lexical(BASE.pathname);
+        if (bp2 && path.indexOf(bp2 + '/') === 0) path = path.slice(bp2.length + 1);
+      }
     } else {
-      // a hardcoded CDN of the app's own files: try the path tail
-      path = path.replace(/^\/+/, '');
+      path = lexical(url);
     }
+
     if (INDEX[path]) return path;
-    var norm = path.replace(/\/\.\//g, '/').replace(/^\.\//, '');
-    if (INDEX[norm]) return norm;
-    // last resort: unique basename match, only if exactly one candidate
-    var bn = norm.split('/').pop();
-    if (bn && CFG.byName && CFG.byName[bn] && CFG.byName[bn].length === 1) {
-      return CFG.byName[bn][0];
+
+    // Mirrored trees: the app asks for the path its original <base href>
+    // made resolve, while the file sits under an escaped mirror directory.
+    // Accept the unique key ENDING with the reference; refuse when it is
+    // ambiguous, because serving the wrong file silently is exactly the
+    // failure this resolver exists to prevent.
+    var bn = path.split('/').pop();
+    var cands = (CFG.byName && CFG.byName[bn]) || null;
+    if (cands && cands.length) {
+      if (cands.length === 1 && (path.indexOf('/') < 0 || cands[0].endsWith('/' + path))) {
+        return cands[0];
+      }
+      var tail = '/' + path, hits = [];
+      for (var ci = 0; ci < cands.length; ci++) {
+        if (cands[ci].endsWith(tail)) hits.push(cands[ci]);
+      }
+      if (hits.length === 1) return hits[0];
+      if (cands.length === 1) return cands[0];
     }
     return null;
   }
@@ -175,16 +227,36 @@
 
   /* ── XMLHttpRequest ───────────────────────────────────────────────── */
   var OrigXHR = window.XMLHttpRequest;
+  /* Define as an OWN data property rather than assigning.
+     Some runtimes (GameMaker's HTML5 export among them) install
+     compatibility accessors on XMLHttpRequest.prototype — and because we
+     replaced the global, that is OUR prototype. A plain `this.response = x`
+     then hits a getter-only property and throws in strict mode, killing the
+     constructor. An own data property shadows the accessor instead. */
+  function own(obj, name, value) {
+    try {
+      Object.defineProperty(obj, name, {
+        value: value, writable: true, enumerable: true, configurable: true,
+      });
+    } catch (e) {
+      try { obj[name] = value; } catch (e2) { /* nothing more to try */ }
+    }
+  }
+
   function XHR() {
     this._l = Object.create(null);
-    this.readyState = 0; this.status = 0; this.statusText = '';
-    this.response = null; this.responseText = ''; this.responseType = '';
-    this.responseURL = ''; this.responseXML = null;
-    this.timeout = 0; this.withCredentials = false;
-    this.onreadystatechange = this.onload = this.onerror = null;
-    this.onloadstart = this.onloadend = this.onprogress = null;
-    this.onabort = this.ontimeout = null;
-    this.upload = { addEventListener: function () { }, removeEventListener: function () { } };
+    own(this, 'readyState', 0); own(this, 'status', 0); own(this, 'statusText', '');
+    own(this, 'response', null); own(this, 'responseText', '');
+    own(this, 'responseType', ''); own(this, 'responseURL', '');
+    own(this, 'responseXML', null);
+    own(this, 'timeout', 0); own(this, 'withCredentials', false);
+    own(this, 'onreadystatechange', null); own(this, 'onload', null);
+    own(this, 'onerror', null); own(this, 'onloadstart', null);
+    own(this, 'onloadend', null); own(this, 'onprogress', null);
+    own(this, 'onabort', null); own(this, 'ontimeout', null);
+    own(this, 'upload', {
+      addEventListener: function () { }, removeEventListener: function () { },
+    });
   }
   XHR.prototype.addEventListener = function (t, fn) { (this._l[t] = this._l[t] || []).push(fn); };
   XHR.prototype.removeEventListener = function (t, fn) {
@@ -207,7 +279,7 @@
   XHR.prototype.open = function (method, url, async) {
     this._method = method; this._url = url;
     this._async = async !== false;
-    this.readyState = 1; this._fire('readystatechange');
+    own(this, 'readyState', 1); this._fire('readystatechange');
   };
   XHR.prototype._fire = function (type, extra) {
     var ev = { type: type, target: this, currentTarget: this };
@@ -220,28 +292,32 @@
   XHR.prototype._deliver = function (data, mime) {
     if (this._aborted) return;
     this._mime = mime; this._len = data.byteLength;
-    this.status = 200; this.statusText = 'OK';
-    try { this.responseURL = new URL(this._url, document.baseURI).href; }
-    catch (e) { this.responseURL = String(this._url); }
+    own(this, 'status', 200); own(this, 'statusText', 'OK');
+    var href;
+    try { href = new URL(this._url, document.baseURI).href; }
+    catch (e) { href = String(this._url); }   // blob: documents have no base
+    own(this, 'responseURL', href);
     var ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     var rt = this.responseType || '';
-    if (rt === 'arraybuffer') this.response = ab;
-    else if (rt === 'blob') this.response = new Blob([ab], { type: mime });
+    if (rt === 'arraybuffer') own(this, 'response', ab);
+    else if (rt === 'blob') own(this, 'response', new Blob([ab], { type: mime }));
     else if (rt === 'json') {
-      try { this.response = JSON.parse(new TextDecoder().decode(data)); }
-      catch (e) { this.response = null; }
+      try { own(this, 'response', JSON.parse(new TextDecoder().decode(data))); }
+      catch (e) { own(this, 'response', null); }
     } else {
       var t = new TextDecoder().decode(data);
-      this.responseText = t; this.response = t;
+      own(this, 'responseText', t); own(this, 'response', t);
       if (rt === 'document' || /xml|html/.test(mime)) {
-        try { this.responseXML = new DOMParser().parseFromString(t, /html/.test(mime) ? 'text/html' : 'text/xml'); }
-        catch (e) { /* not parseable */ }
+        try {
+          own(this, 'responseXML', new DOMParser().parseFromString(
+            t, /html/.test(mime) ? 'text/html' : 'text/xml'));
+        } catch (e) { /* not parseable */ }
       }
     }
-    this.readyState = 2; this._fire('readystatechange');
-    this.readyState = 3; this._fire('readystatechange');
+    own(this, 'readyState', 2); this._fire('readystatechange');
+    own(this, 'readyState', 3); this._fire('readystatechange');
     this._fire('progress', { lengthComputable: true, loaded: this._len, total: this._len });
-    this.readyState = 4; this._fire('readystatechange');
+    own(this, 'readyState', 4); this._fire('readystatechange');
     this._fire('load'); this._fire('loadend');
   };
   XHR.prototype.send = function () {
@@ -462,13 +538,29 @@
     var s = atob(b64), B = new Uint8Array(s.length), i;
     for (i = 0; i < s.length; i++) B[i] = s.charCodeAt(i);
     var IDX = cfg.index;
+    // Resolved lexically, for the same reason as the main thread: a worker
+    // spawned from a blob document has no hierarchical base to resolve
+    // against, and new URL(relative, blobUrl) throws.
     function key(u) {
-      try {
-        var a = new URL(u, cfg.base), b = new URL(cfg.base);
-        var p = decodeURIComponent(a.pathname), bp = decodeURIComponent(b.pathname);
-        p = p.indexOf(bp) === 0 ? p.slice(bp.length) : p.replace(/^\/+/, '');
-        return IDX[p] ? p : null;
-      } catch (e) { return null; }
+      if (u == null) return null;
+      u = String(typeof u === 'object' && u.url ? u.url : u);
+      if (/^(data|blob|javascript|about):/i.test(u)) return null;
+      var p = u.split('#')[0].split('?')[0].replace(/\\/g, '/');
+      if (/^(https?:)?\/\//i.test(p)) p = p.replace(/^(https?:)?\/\/[^/]*/i, '');
+      try { p = decodeURIComponent(p); } catch (e) { /* leave as written */ }
+      var parts = p.split('/'), out = [];
+      for (var j = 0; j < parts.length; j++) {
+        if (parts[j] === '' || parts[j] === '.') continue;
+        if (parts[j] === '..') { out.pop(); continue; }
+        out.push(parts[j]);
+      }
+      p = out.join('/');
+      if (IDX[p]) return p;
+      var bn = p.split('/').pop();
+      if (bn && cfg.byName && cfg.byName[bn] && cfg.byName[bn].length === 1) {
+        return cfg.byName[bn][0];
+      }
+      return null;
     }
     var slice = function (k) { return B.subarray(IDX[k][0], IDX[k][0] + IDX[k][1]); };
     self.fetch = function (u) {
@@ -497,7 +589,7 @@
       var key = toKey(url);
       if (key) {
         var boot = '(' + workerBoot.toString() + ')('
-          + JSON.stringify({ index: INDEX, base: BASE.href }) + ','
+          + JSON.stringify({ index: INDEX, byName: CFG.byName || {} }) + ','
           + JSON.stringify(u8b64(BYTES)) + ');\n';
         var src = new TextDecoder().decode(bytesOf(key));
         return new OrigWorker(URL.createObjectURL(
@@ -515,7 +607,7 @@
     // rejection surfaces as an uncaught error in most engines
     navigator.serviceWorker.register = function () {
       return Promise.resolve({
-        scope: BASE.href, active: null, installing: null, waiting: null,
+        scope: (BASE && BASE.href) || './', active: null, installing: null, waiting: null,
         addEventListener: function () { }, update: function () { return Promise.resolve(); },
         unregister: function () { return Promise.resolve(true); },
       });

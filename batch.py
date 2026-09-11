@@ -109,11 +109,16 @@ def main():
         built.append(stats)
 
         entry_url = '/'.join([a.base_url, tab, name, b.entry])
+        fileurl = '%s/%s' % (a.port_url, os.path.basename(outfile))
+        # Verify through the blob harness, because that is how Red Portal
+        # actually launches a game. Serving the file over http:// exercises a
+        # different URL context entirely and hides every base-resolution bug.
         jobs.append({
             'name': label,
-            'portUrl': '%s/%s' % (a.port_url, os.path.basename(outfile)),
+            'portUrl': '%s/blob-harness.html?f=%s' % (a.port_url, os.path.basename(outfile)),
             'baseUrl': entry_url.replace(' ', '%20'),
-            'wait': 9000 if size < 40 * 1048576 else 20000,
+            'ignore': [fileurl],
+            'wait': 12000 if size < 40 * 1048576 else 24000,
         })
 
     report = {'built': built, 'skipped': skipped, 'failed': failed}

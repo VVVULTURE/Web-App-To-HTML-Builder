@@ -148,6 +148,21 @@ class Builder(object):
             key = key[2:]
         if key in self.vfs:
             return key
+
+        # Site rippers mirror a remote tree into escaped directory names
+        # ("https://host/x@main/" -> "https_/_/host/x_main/"), and the page
+        # still refers to files the way the original <base href> made them
+        # resolve. Rather than reverse-engineer each ripper's escaping, take
+        # the unique file whose path ENDS with the reference. Only accept it
+        # when exactly one candidate matches -- an ambiguous match would
+        # silently serve the wrong file, which is the failure mode this
+        # resolver exists to avoid.
+        tail = '/' + key
+        hits = [k for k in self.vfs if k.endswith(tail)]
+        if len(hits) == 1:
+            self.notes.append('resolved by unique suffix: %s -> %s' % (ref, hits[0]))
+            return hits[0]
+
         self.missing.append(ref)
         return None
 
@@ -244,7 +259,27 @@ class Builder(object):
                 # inline scripts ignore defer/async; order is preserved, which
                 # is what almost every loader actually depends on
                 self.notes.append('inlined a defer/async script: ' + k)
-            return '<script%s>\n/* wathb: %s */\n%s\n</script>' % (attrs, k, body)
+
+            # An INLINE script never fires a load event, so an onload handler
+            # on the original tag would simply never run -- and for loaders
+            # that start the app from onload (love.js does exactly this) the
+            # result is a page that sits at "Downloading..." forever with no
+            # error at all. Invoke it explicitly, with `this` bound to the
+            # script element as the attribute form guarantees.
+            after = ''
+            om = re.search(r'\bonload\s*=\s*(["\'])(.*?)\1', tag, re.I | re.S)
+            if om:
+                handler = re.sub(r'</(script)', r'<\\/\1', om.group(2), flags=re.I)
+                self.notes.append('replayed onload for inlined script: ' + k)
+                after = (
+                    '\n<script>/* wathb: the original tag had onload */\n'
+                    '(function(){var s=document.currentScript'
+                    '&&document.currentScript.previousElementSibling;'
+                    'try{(function(event){' + handler + '}).call(s,new Event("load"));}'
+                    'catch(e){console.error("wathb onload replay:",e);}})();\n'
+                    '</script>')
+            return ('<script%s>\n/* wathb: %s */\n%s\n</script>%s'
+                    % (attrs, k, body, after))
 
         html = re.sub(
             r'<script\b[^>]*\bsrc\s*=\s*["\']([^"\']+)["\'][^>]*>\s*</script>',
@@ -343,7 +378,7 @@ class Builder(object):
 
         cfg = {
             'index': index,
-            'byName': {k: v for k, v in by_name.items() if len(v) == 1},
+            'byName': by_name,
             'payload': chunks,
             'quiet': self.quiet,
             'log': self.log,

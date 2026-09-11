@@ -18,6 +18,7 @@ import { join } from 'node:path';
 
 const argv = process.argv.slice(2);
 const arg = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : d; };
+const FULL = argv.includes('--full');
 
 const EXES = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -64,7 +65,7 @@ const send = (method, params = {}, sessionId) => new Promise((res) => {
   ws.send(JSON.stringify({ id: n, method, params, ...(sessionId ? { sessionId } : {}) }));
 });
 
-async function check(url, waitMs) {
+async function check(url, waitMs, ignore) {
   const { result: { targetId } } = await send('Target.createTarget', { url: 'about:blank' });
   const { result: { sessionId } } = await send('Target.attachToTarget', { targetId, flatten: true });
   const ev = []; sessions.set(sessionId, ev);
@@ -86,7 +87,11 @@ async function check(url, waitMs) {
       const t = (p.exceptionDetails?.exception?.description
         || p.exceptionDetails?.text || '');
       // extensions injected into the page are not the port's doing
-      if (!t.includes('chrome-extension://')) exceptions.push(t.split('\n')[0].slice(0, 300));
+      if (!t.includes('chrome-extension://')) {
+        // --full keeps the stack: the first line names the error but almost
+        // never says which code provoked it
+        exceptions.push(FULL ? t.slice(0, 2000) : t.split('\n')[0].slice(0, 300));
+      }
     }
     if (e.method === 'Log.entryAdded' && p.entry.level === 'error') {
       if (!p.entry.text.includes('chrome-extension://')) errors.push(p.entry.text.slice(0, 300));
@@ -97,9 +102,13 @@ async function check(url, waitMs) {
       netFail.push(`HTTP ${p.response.status} ${p.response.url}`);
     }
   }
+  // Visible text matters as much as the error list: a port can load with a
+  // completely clean console and still sit forever on "Downloading...",
+  // which is precisely what a defect looks like to a player.
   const probe = await send('Runtime.evaluate', {
     expression: `JSON.stringify({title:document.title,
       body:document.body?document.body.innerHTML.length:0,
+      text:(document.body?document.body.innerText||'':'').replace(/\\s+/g,' ').trim().slice(0,300),
       canvas:(function(){var c=document.querySelector('canvas');
         return c?{w:c.width,h:c.height}:null})()})`,
     returnByValue: true,
@@ -108,10 +117,12 @@ async function check(url, waitMs) {
   sessions.delete(sessionId);
   await send('Target.closeTarget', { targetId });
 
-  const self = new URL(url);
   const sub = [...new Set(reqs)].filter((u) => {
     if (u.startsWith('data:') || u.startsWith('blob:')) return false;
-    return u !== url;
+    if (u === url) return false;
+    // the blob harness fetches the file under test; that is the harness, not
+    // the port, and it does not exist once Red Portal serves the html itself
+    return !(ignore || []).some((ig) => u === ig || u.split('?')[0] === ig);
   });
   let info = {};
   try { info = JSON.parse(probe.result?.result?.value || '{}'); } catch { }
@@ -132,32 +143,42 @@ if (jobsFile) {
   let n = 0;
   for (const j of jobs) {
     n++;
-    const port = await check(j.portUrl, j.wait || 9000);
+    const port = await check(j.portUrl, j.wait || 9000, j.ignore);
     let base = null;
-    if (j.baseUrl) base = await check(j.baseUrl, j.wait || 9000);
+    if (j.baseUrl) base = await check(j.baseUrl, j.wait || 9000, j.ignore);
 
     // only count problems the original did not already have
     const known = new Set([...(base?.errors || []), ...(base?.exceptions || [])].map(norm));
     const newErrors = port.errors.filter((e) => !known.has(norm(e)));
     const newExc = port.exceptions.filter((e) => !known.has(norm(e)));
-    const pass = !newErrors.length && !newExc.length
-      && !port.netFail.length && !port.subRequests.length;
 
-    results.push({ name: j.name, pass, newErrors, newExceptions: newExc,
+    // Stuck-loader detection. A clean console is not proof the app runs:
+    // Balatro sat on "Downloading..." with zero errors and zero requests
+    // because an inlined script's onload never fired. If the port still shows
+    // loader text that the original has moved past, it is broken.
+    const LOADER = /\b(downloading|loading|preparing|please wait|initialising|initializing)\b/i;
+    const stuck = !!(port.text && LOADER.test(port.text)
+      && !(base && base.text && LOADER.test(base.text)));
+
+    const pass = !newErrors.length && !newExc.length
+      && !port.netFail.length && !port.subRequests.length && !stuck;
+
+    results.push({ name: j.name, pass, stuck, newErrors, newExceptions: newExc,
       netFail: port.netFail, subRequests: port.subRequests,
-      port: { title: port.title, body: port.body, canvas: port.canvas },
+      port: { title: port.title, body: port.body, canvas: port.canvas, text: port.text },
       base: base && { title: base.title, body: base.body, canvas: base.canvas,
-        requests: base.totalRequests } });
+        text: base.text, requests: base.totalRequests } });
     console.log(`[${String(n).padStart(3)}/${jobs.length}] ${pass ? 'PASS' : 'FAIL'}  ${j.name}`
       + (pass ? '' : `  (${newErrors.length + newExc.length} new err, `
-        + `${port.netFail.length} netfail, ${port.subRequests.length} requests)`));
+        + `${port.netFail.length} netfail, ${port.subRequests.length} requests`
+        + `${stuck ? ', STUCK ON LOADER' : ''})`));
   }
   const out = arg('--out', 'verify-report.json');
   writeFileSync(out, JSON.stringify(results, null, 2));
   const passed = results.filter((r) => r.pass).length;
   console.log(`\n${passed}/${results.length} passed  ->  ${out}`);
 } else {
-  const r = await check(arg('--url'), Number(arg('--wait', 9000)));
+  const r = await check(arg('--url'), Number(arg('--wait', 9000)), (arg('--ignore','')||'').split(',').filter(Boolean));
   console.log(JSON.stringify(r, null, 2));
 }
 
