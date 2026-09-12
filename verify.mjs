@@ -19,6 +19,7 @@ import { join } from 'node:path';
 const argv = process.argv.slice(2);
 const arg = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : d; };
 const FULL = argv.includes('--full');
+const CLICK = arg('--click');
 
 const EXES = [
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -90,7 +91,24 @@ async function check(url, waitMs, ignore) {
   await send('Network.enable', {}, sessionId);
   await send('Page.enable', {}, sessionId);
   await send('Page.navigate', { url }, sessionId);
-  await sleep(waitMs);
+
+  // Some games do nothing until a start button is pressed -- Stardew Valley
+  // sits on a download-options menu and never boots its runtime, so a check
+  // that only loads the page reports a clean console for a game that has not
+  // actually started. Click, then keep waiting.
+  if (CLICK) {
+    await sleep(Math.min(waitMs, 12000));
+    await send('Runtime.evaluate', {
+      expression: `(function(){var re=new RegExp(${JSON.stringify(CLICK)},'i');
+        var els=[].slice.call(document.querySelectorAll('button,a,input[type=button],input[type=submit],div[role=button],span'));
+        var t=els.filter(function(e){return re.test(e.textContent||e.value||'')})[0];
+        if(t){t.click();return 'clicked';} return 'no match';})()`,
+      returnByValue: true,
+    }, sessionId);
+    await sleep(waitMs);
+  } else {
+    await sleep(waitMs);
+  }
 
   const errors = [], exceptions = [], netFail = [], reqs = [];
   for (const e of ev) {
