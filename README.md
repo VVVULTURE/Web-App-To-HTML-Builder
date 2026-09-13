@@ -94,6 +94,19 @@ every single port.
 - `defer`/`async` scripts become ordinary inline scripts. Order is preserved,
   which is what loaders actually depend on, but the note is recorded.
 
+## Where the rest of the knowledge lives
+
+This repo holds the tool. The findings live with the project it serves, in
+`github.com/VVVULTURE/red-portal-DKR-LCL`:
+
+- `docs/SINGLE-FILE-PORTS.md` — every defect class found while building 70
+  ports, the measured limits, and the traps that produced *false* verification
+  results.
+- `docs/SESSION-HISTORY.md` — Red Portal itself: architecture, bug ledger,
+  runbook.
+
+Update them when this pipeline changes.
+
 ## Verifying
 
 `verify.mjs` drives Edge or Chrome over CDP with no dependencies (Node 22+
