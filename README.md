@@ -42,7 +42,11 @@ setter catches nothing. So the builder rewrites them:
 | `url()` in CSS | data URI, resolved **relative to the stylesheet**, not the document |
 | `<img>`, `<audio>`, `<video>`, `srcset` | data URI under 256 KB, `data-wathb-src` above it |
 | `<base href>` | removed — it would re-point every relative URL |
-| external `<script>` / `<link>` | dropped, so they cannot request or error |
+| `<script src>` with an `onload` | handler replayed; inline scripts never fire load events |
+| `<script>` with BOTH a src and a body | inlined — the spec ignores the body, so requiring it to be empty skipped the tag entirely |
+| `<iframe src="local.html">` | built recursively and attached at runtime as a blob; it is its own document and our hooks do not reach inside it |
+| external `<script>` / `<link>` | **fetched at build time and embedded** if it is a real library; dropped if it is telemetry |
+| `<meta charset>` | emitted FIRST — the payload otherwise pushes the document's own past the 1024 bytes a browser sniffs, and everything non-ASCII turns to mojibake |
 
 Everything else is concatenated into one payload, base64'd, and carried in
 the file alongside an index of `path -> [offset, length, mime]`.
@@ -65,16 +69,25 @@ Installed in `<head>` before any app code. Catches everything dynamic:
 
 ## Design decisions worth keeping
 
-**Paths resolve through `new URL(ref, base)`** — the algorithm the browser
-itself uses — never by substring or basename matching. Two files called
-`data.json` in different folders are different files; fuzzy matching silently
-serves the wrong one. A unique-basename fallback exists but only fires when
-exactly one candidate matches.
+**Paths resolve LEXICALLY, never by substring or basename matching.** Two
+files called `data.json` in different folders are different files; fuzzy
+matching silently serves the wrong one. Lexically rather than via
+`new URL(ref, base)` because the base is frequently unusable: in a **blob:
+document** — which is how Red Portal runs every game — `new URL('.',
+document.baseURI)` **throws**, since blob URLs are opaque rather than
+hierarchical. Anything assuming a resolvable base dies before a single hook is
+installed and takes the whole app with it. A unique-suffix fallback handles
+mirrored CDN trees and percent-encoded filenames, and refuses when ambiguous.
 
 **A missing file returns a synthetic success, not a 404.** `{}` for JSON, a
 1×1 PNG for images, a valid silent WAV for audio, empty text for JS/CSS. This
 is what keeps the console clean and stops the app noticing anything is
 absent. `--loud` disables it while debugging.
+
+**Text is decoded as UTF-8, falling back to latin-1 — never `'replace'`.**
+`'replace'` turns every invalid byte into U+FFFD irreversibly, which silently
+breaks any Latin-1 script and surfaces as an undefined library three steps
+later. latin-1 round-trips bytes 1:1.
 
 **All bytes live in one `ArrayBuffer`, decoded once.** Per-file base64 costs
 33% inflation and an `atob` call per asset.
@@ -115,4 +128,11 @@ only problems the original did not already have — most games log warnings of
 their own, and flagging those makes the report useless.
 
 A port passes when it has no new errors, no new exceptions, no failed
-requests, and **no sub-requests at all**.
+requests, **no sub-requests at all**, and is not still showing loader text the
+original has moved past.
+
+**"Passed" means "no worse than the original", not "works."** A game can sit on
+a menu forever with a spotless console — pass `--click <text>` to start one
+that is gated behind a button. And verify through `blob-harness.html`: serving
+a port over `http://` is a different URL context and has twice passed games
+that were broken in production.
